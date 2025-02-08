@@ -123,7 +123,7 @@ def main():
     # Charger les payloads standards
     default_payloads = [
         "<script>alert('XSS')</script>",
-        "כ<script>alert('פריצה')</script>",  # Hébreu : "Hacking"
+        "כ<script>alert('נפרץ על ידי טראחקנון')</script>",  # Hébreu : "Hacking"
         "'><svg/onload=alert('פריצה')>",
     ]
 
